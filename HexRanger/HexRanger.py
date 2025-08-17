@@ -1,12 +1,31 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HexRanger - Modern Lightweight IDS/IPS
+Author: corki33 (improved by ChatGPT)
+
+Features:
+- Real-time packet sniffing with scapy
+- Detection of SYN flood, UDP flood, and port scanning
+- Detection of external probes into the local network
+- Automatic IP blocking via nftables (Linux) or netsh (Windows)
+- Temporary bans with auto-expiry
+- Logging in text or JSON format
+- Export of threats to CSV for further analysis
+"""
+
 import configparser
+import logging
+import json
 from scapy.all import sniff, IP, TCP, UDP, Ether
-from collections import defaultdict
+from collections import defaultdict, deque
 import time
 from datetime import datetime
 import os
 import platform
 import csv
 import subprocess
+import ipaddress
 
 # --- Load configuration ---
 config = configparser.ConfigParser()
@@ -14,26 +33,53 @@ config.read("config.ini")
 
 INTERFACE = config.get("network", "interface")
 MY_IP = config.get("network", "my_ip")
-LOCAL_NET = config.get("network", "local_net")
+LOCAL_NET = ipaddress.ip_network(config.get("network", "local_net"))
 
 SAFE_IPS = set(ip.strip() for ip in config.get("safe", "safe_ips").split(","))
+SAFE_MACS = set(mac.strip().lower() for mac in config.get("safe", "safe_macs").split(","))
 SAFE_PORTS = set(int(p) for p in config.get("safe", "safe_ports").split(","))
 
 ALERT_THRESHOLD = config.getint("alerts", "alert_threshold")
 TIME_WINDOW = config.getint("alerts", "time_window")
+BAN_TIME = config.getint("alerts", "ban_time")
 LOGFILE = config.get("alerts", "logfile")
+LOG_FORMAT = config.get("alerts", "log_format").lower()
 BANFILE = "banned_ips.txt"
 THREATS_CSV = "threats.csv"
 
-# --- GLOBAL VARIABLES ---
-ip_activity = defaultdict(list)
-syn_packets = defaultdict(list)
+# --- Setup logging ---
+logger = logging.getLogger("HexRanger")
+logger.setLevel(logging.INFO)
+fh = logging.FileHandler(LOGFILE, encoding="utf-8")
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+
+# --- Global state ---
+ip_activity = defaultdict(deque)
+syn_packets = defaultdict(deque)
 portscan_attempts = defaultdict(set)
-udp_packets = defaultdict(list)
-banned_ips = set()
+udp_packets = defaultdict(deque)
+banned_ips = {}
 
-# --- BLOCKING /RESPONSE FUNCTIONS ---
+# --- Helper logging ---
+def log_event(ip, mac, event_type, message):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if LOG_FORMAT == "json":
+        entry = json.dumps({
+            "timestamp": now,
+            "ip": ip,
+            "mac": mac,
+            "event": event_type,
+            "message": message
+        })
+        logger.info(entry)
+    else:
+        logger.info(f"[{ip} | MAC: {mac}] {event_type}: {message}")
 
+    export_to_csv(ip, mac, event_type, message)
+
+# --- Blocking functions ---
 def block_ip(ip):
     system = platform.system()
     try:
@@ -41,32 +87,48 @@ def block_ip(ip):
             rule_name = f"HexRanger_Block_{ip.replace('.', '_')}"
             check_cmd = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"]
             result = subprocess.run(check_cmd, capture_output=True, text=True)
-            if "No rules match the specified criteria" not in result.stdout:
-                print(f"[i] Firewall rule for {ip} already exists.")
+            if "No rules match" not in result.stdout:
                 return
             add_cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
                        f"name={rule_name}", "dir=in", "action=block", f"remoteip={ip}"]
             subprocess.run(add_cmd, capture_output=True, check=True)
-            print(f"[+] Firewall rule added for IP: {ip}")
         elif system == "Linux":
-            subprocess.run(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"],
+            subprocess.run(["nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"],
                            capture_output=True, check=False)
-            subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"],
-                           capture_output=True, check=True)
-            print(f"[+] IPTables: IP {ip} blocked.")
     except subprocess.CalledProcessError as e:
-        print(f"[!] Failed to block IP {ip}: {e}")
+        logger.error(f"Failed to block IP {ip}: {e}")
 
-def respond_to_threat(ip, reason):
+def unblock_ip(ip):
+    system = platform.system()
+    try:
+        if system == "Windows":
+            rule_name = f"HexRanger_Block_{ip.replace('.', '_')}"
+            del_cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"]
+            subprocess.run(del_cmd, capture_output=True, check=False)
+        elif system == "Linux":
+            subprocess.run(["nft", "delete", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"],
+                           capture_output=True, check=False)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to unblock IP {ip}: {e}")
+
+def respond_to_threat(ip, mac, reason):
+    now = time.time()
     if ip not in banned_ips:
-        banned_ips.add(ip)
+        banned_ips[ip] = now
         with open(BANFILE, "a") as f:
             f.write(f"{ip} # {reason} @ {datetime.now()}\n")
-        print(f"[!] IP {ip} added to banned list for reason: {reason}")
         block_ip(ip)
+        log_event(ip, mac, "BAN", f"IP banned for {reason}")
 
-# --- EXPORT TO CSV---
+def check_unban():
+    now = time.time()
+    expired = [ip for ip, t in banned_ips.items() if now - t > BAN_TIME]
+    for ip in expired:
+        unblock_ip(ip)
+        log_event(ip, "??:??:??:??:??:??", "UNBAN", "Ban expired")
+        del banned_ips[ip]
 
+# --- CSV export ---
 def export_to_csv(ip, mac, reason, details):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_exists = os.path.isfile(THREATS_CSV)
@@ -76,40 +138,22 @@ def export_to_csv(ip, mac, reason, details):
             writer.writerow(["timestamp", "ip", "mac", "type", "details"])
         writer.writerow([now, ip, mac, reason, details])
 
-# --- LOGING ---
+# --- Packet filters ---
+def is_safe(packet):
+    if IP not in packet:
+        return True
+    ip_src = packet[IP].src
+    ip_dst = packet[IP].dst
+    mac_src = packet[Ether].src if Ether in packet else None
 
-def log_event_grouped(ip, mac, message):
-    timestamp = datetime.now().strftime("%H:%M %d.%m.%Y")
-    is_local = ip.startswith(LOCAL_NET)
-    is_threat = any(keyword in message.lower() for keyword in ["flood", "scan", "external connection", "threat"])
-
-    if is_threat:
-        section_file = "================ [THREATS] =================="
-    elif is_local:
-        section_file = "================== [LOCAL NETWORK] ================"
-    else:
-        section_file = "============ [EXTERNAL IPs] =================="
-
-    header = f"[{ip} | MAC: {mac}]"
-    entry = f" - {timestamp}: {message}"
-
-    with open(LOGFILE, "a", encoding="utf-8") as f:
-        f.write(f"\n{section_file}\n")
-        f.write(f"{header}\n")
-        f.write(f"{entry}\n")
-
-# --- FILTERS ---
-
-def is_safe_ip(ip_src, ip_dst):
     if ip_src in SAFE_IPS or ip_dst in SAFE_IPS:
+        return True
+    if mac_src and mac_src.lower() in SAFE_MACS:
         return True
     if ip_src == MY_IP:
         return True
-    if ip_src.startswith(LOCAL_NET) and ip_dst.startswith(LOCAL_NET):
+    if ipaddress.ip_address(ip_src) in LOCAL_NET and ipaddress.ip_address(ip_dst) in LOCAL_NET:
         return True
-    return False
-
-def is_safe_port(packet):
     if TCP in packet:
         if packet[TCP].dport in SAFE_PORTS or packet[TCP].sport in SAFE_PORTS:
             return True
@@ -118,107 +162,63 @@ def is_safe_port(packet):
             return True
     return False
 
-def is_suspicious(packet):
-    if IP not in packet:
-        return False
-    ip_src = packet[IP].src
-    ip_dst = packet[IP].dst
-    if is_safe_ip(ip_src, ip_dst):
-        return False
-    if is_safe_port(packet):
-        return False
-    return True
-
-def is_external_probe(packet):
-    if IP not in packet:
-        return False
-    ip_src = packet[IP].src
-    ip_dst = packet[IP].dst
-    return not ip_src.startswith(LOCAL_NET) and ip_dst.startswith(LOCAL_NET)
-
-# --- THREAT DETECTION ---
+# --- Threat detection ---
 def detect_threat(packet):
-    if is_external_probe(packet):
-        try:
-            ip_src = packet[IP].src
-            ip_dst = packet[IP].dst
-            mac_src = packet[Ether].src if Ether in packet else "??:??:??:??:??:??"
-            if TCP in packet:
-                proto = "TCP"
-                port = packet[TCP].dport
-            elif UDP in packet:
-                proto = "UDP"
-                port = packet[UDP].dport
-            else:
-                proto = "OTHER"
-                port = "-"
-            msg = f"External connection to {ip_dst}:{port} ({proto})"
-            print(f"[!] EXTERNAL: {ip_src} → {ip_dst}:{port}")
-            log_event_grouped(ip_src, mac_src, msg)
-            respond_to_threat(ip_src, "External connection")
-            export_to_csv(ip_src, mac_src, "External connection", msg)
-        except Exception as e:
-            print(f"[!] Error analyzing external packet: {e}")
-        return
+    check_unban()
 
-    if not is_suspicious(packet):
-        return
-
-    if IP not in packet:
+    if not IP in packet:
         return
 
     ip_src = packet[IP].src
+    ip_dst = packet[IP].dst
     mac_src = packet[Ether].src if Ether in packet else "??:??:??:??:??:??"
     now = time.time()
 
-    ip_activity[ip_src].append(now)
-    ip_activity[ip_src] = [t for t in ip_activity[ip_src] if now - t <= TIME_WINDOW]
+    if is_safe(packet):
+        return
 
+    # External probe detection
+    if not ipaddress.ip_address(ip_src) in LOCAL_NET and ipaddress.ip_address(ip_dst) in LOCAL_NET:
+        log_event(ip_src, mac_src, "EXTERNAL", f"External connection attempt to {ip_dst}")
+        respond_to_threat(ip_src, mac_src, "External probe")
+        return
+
+    # Activity tracking
+    ip_activity[ip_src].append(now)
+    while ip_activity[ip_src] and now - ip_activity[ip_src][0] > TIME_WINDOW:
+        ip_activity[ip_src].popleft()
+
+    # SYN flood and port scan
     if TCP in packet:
         flags = packet[TCP].flags
         if flags == "S":
             syn_packets[ip_src].append(now)
-            syn_packets[ip_src] = [t for t in syn_packets[ip_src] if now - t <= TIME_WINDOW]
+            while syn_packets[ip_src] and now - syn_packets[ip_src][0] > TIME_WINDOW:
+                syn_packets[ip_src].popleft()
             portscan_attempts[ip_src].add(packet[TCP].dport)
 
             if len(syn_packets[ip_src]) > ALERT_THRESHOLD:
-                msg = f"SYN flood attempt - {len(syn_packets[ip_src])} SYNs in {TIME_WINDOW}s"
-                print(f"[!] ALERT: {ip_src} MAC: {mac_src} - {msg}")
-                log_event_grouped(ip_src, mac_src, msg)
-                respond_to_threat(ip_src, "SYN flood")
-                export_to_csv(ip_src, mac_src, "SYN flood", msg)
+                log_event(ip_src, mac_src, "SYN_FLOOD", f"{len(syn_packets[ip_src])} SYNs in {TIME_WINDOW}s")
+                respond_to_threat(ip_src, mac_src, "SYN flood")
 
             if len(portscan_attempts[ip_src]) > ALERT_THRESHOLD:
                 ports = sorted(portscan_attempts[ip_src])
-                msg = f"Port scan detected - ports: {ports}"
-                print(f"[!] ALERT: {ip_src} MAC: {mac_src} - {msg}")
-                log_event_grouped(ip_src, mac_src, msg)
-                respond_to_threat(ip_src, "Port scan")
-                export_to_csv(ip_src, mac_src, "Port scan", msg)
+                log_event(ip_src, mac_src, "PORT_SCAN", f"Ports scanned: {ports}")
+                respond_to_threat(ip_src, mac_src, "Port scan")
 
-        if flags == "F":
-            msg = f"Connection closed to {packet[IP].dst}:{packet[TCP].dport}"
-            print(f"[i] {ip_src} MAC: {mac_src} {msg}")
-            log_event_grouped(ip_src, mac_src, msg)
-
+    # UDP flood
     if UDP in packet:
         udp_packets[ip_src].append(now)
-        udp_packets[ip_src] = [t for t in udp_packets[ip_src] if now - t <= TIME_WINDOW]
+        while udp_packets[ip_src] and now - udp_packets[ip_src][0] > TIME_WINDOW:
+            udp_packets[ip_src].popleft()
 
         if len(udp_packets[ip_src]) > ALERT_THRESHOLD:
-            msg = f"UDP flood attempt - {len(udp_packets[ip_src])} packets in {TIME_WINDOW}s"
-            print(f"[!] ALERT: {ip_src} MAC: {mac_src} - {msg}")
-            log_event_grouped(ip_src, mac_src, msg)
-            respond_to_threat(ip_src, "UDP flood")
-            export_to_csv(ip_src, mac_src, "UDP flood", msg)
+            log_event(ip_src, mac_src, "UDP_FLOOD", f"{len(udp_packets[ip_src])} UDP packets in {TIME_WINDOW}s")
+            respond_to_threat(ip_src, mac_src, "UDP flood")
 
-        msg = f"UDP packet to {packet[IP].dst}:{packet[UDP].dport}"
-        print(f"[i] {ip_src} MAC: {mac_src} {msg}")
-        log_event_grouped(ip_src, mac_src, msg)
-
-# --- MAIN FUNCTION ---
+# --- Main ---
 def main():
-    print(f"[*] Listening on interface: {INTERFACE}...")
+    logger.info(f"[*] HexRanger listening on interface {INTERFACE}")
     if not os.path.exists(BANFILE):
         open(BANFILE, "w").close()
     sniff(iface=INTERFACE, prn=detect_threat, store=0)
