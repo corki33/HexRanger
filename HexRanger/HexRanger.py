@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HexRanger - Modern Lightweight IDS/IPS
-Author: corki33 (improved by ChatGPT)
-
 Features:
 - Real-time packet sniffing with scapy
 - Detection of SYN flood, UDP flood, and port scanning
@@ -225,3 +222,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
