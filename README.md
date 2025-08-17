@@ -53,5 +53,3 @@ alert_threshold = 10
 time_window = 5
 logfile = log.log
 
-## Notes 
-HexRanger requires administrative/root privileges to modify firewall rules and works on both Windows and
